@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Lint as: python3
 """MusicVAE training script."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 
 from magenta.models.music_vae import configs
 from magenta.models.music_vae import data
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+import tf_slim
 
 flags = tf.app.flags
 FLAGS = flags.FLAGS
@@ -33,6 +30,9 @@ flags.DEFINE_string(
 flags.DEFINE_string(
     'examples_path', None,
     'Path to a TFRecord file of NoteSequence examples. Overrides the config.')
+flags.DEFINE_string(
+    'tfds_name', None,
+    'TensorFlow Datasets dataset name to use. Overrides the config.')
 flags.DEFINE_string(
     'run_dir', None,
     'Path where checkpoints and summary events will be located during '
@@ -61,6 +61,10 @@ flags.DEFINE_string(
     'hparams', '',
     'A comma-separated list of `name=value` hyperparameter values to merge '
     'with those in the config.')
+flags.DEFINE_bool(
+    'cache_dataset', True,
+    'Whether to cache the dataset in memory for improved training speed. May '
+    'cause memory errors for very large datasets.')
 flags.DEFINE_integer(
     'task', 0,
     'The task number for this worker.')
@@ -70,12 +74,6 @@ flags.DEFINE_integer(
 flags.DEFINE_integer(
     'num_sync_workers', 0,
     'The number of synchronized workers.')
-flags.DEFINE_integer(
-    'num_data_threads', 4,
-    'The number of data preprocessing threads.')
-flags.DEFINE_integer(
-    'prefetch_size', 4,
-    'How many batches to prefetch at the end of the data pipeline.')
 flags.DEFINE_string(
     'eval_dir_suffix', '',
     'Suffix to add to eval output directory.')
@@ -114,7 +112,7 @@ def _trial_summary(hparams, examples_path, output_dir):
 def _get_input_tensors(dataset, config):
   """Get input tensors from dataset."""
   batch_size = config.hparams.batch_size
-  iterator = dataset.make_one_shot_iterator()
+  iterator = tf.data.make_one_shot_iterator(dataset)
   (input_sequence, output_sequence, control_sequence,
    sequence_length) = iterator.get_next()
   input_sequence.set_shape(
@@ -150,7 +148,9 @@ def train(train_dir,
   tf.gfile.MakeDirs(train_dir)
   is_chief = (task == 0)
   if is_chief:
-    _trial_summary(config.hparams, config.train_examples_path, train_dir)
+    _trial_summary(
+        config.hparams, config.train_examples_path or config.tfds_name,
+        train_dir)
   with tf.Graph().as_default():
     with tf.device(tf.train.replica_device_setter(
         num_ps_tasks, merge_devices=True)):
@@ -169,7 +169,7 @@ def train(train_dir,
             num_sync_workers)
         hooks.append(optimizer.make_session_run_hook(is_chief))
 
-      grads, var_list = zip(*optimizer.compute_gradients(model.loss))
+      grads, var_list = list(zip(*optimizer.compute_gradients(model.loss)))
       global_norm = tf.global_norm(grads)
       tf.summary.scalar('global_norm', global_norm)
 
@@ -186,7 +186,8 @@ def train(train_dir,
         raise ValueError(
             'Unknown clip_mode: {}'.format(config.hparams.clip_mode))
       train_op = optimizer.apply_gradients(
-          zip(clipped_grads, var_list), global_step=model.global_step,
+          list(zip(clipped_grads, var_list)),
+          global_step=model.global_step,
           name='train_step')
 
       logging_dict = {'global_step': model.global_step,
@@ -200,7 +201,7 @@ def train(train_dir,
           saver=tf.train.Saver(
               max_to_keep=checkpoints_to_keep,
               keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours))
-      tf.contrib.training.train(
+      tf_slim.training.train(
           train_op=train_op,
           logdir=train_dir,
           scaffold=scaffold,
@@ -219,7 +220,8 @@ def evaluate(train_dir,
   """Evaluate the model repeatedly."""
   tf.gfile.MakeDirs(eval_dir)
 
-  _trial_summary(config.hparams, config.eval_examples_path, eval_dir)
+  _trial_summary(
+      config.hparams, config.eval_examples_path or config.tfds_name, eval_dir)
   with tf.Graph().as_default():
     model = config.model
     model.build(config.hparams,
@@ -230,9 +232,10 @@ def evaluate(train_dir,
         **_get_input_tensors(dataset_fn().take(num_batches), config))
 
     hooks = [
-        tf.contrib.training.StopAfterNEvalsHook(num_batches),
-        tf.contrib.training.SummaryAtEndHook(eval_dir)]
-    tf.contrib.training.evaluate_repeatedly(
+        tf_slim.evaluation.StopAfterNEvalsHook(num_batches),
+        tf_slim.evaluation.SummaryAtEndHook(eval_dir)
+    ]
+    tf_slim.evaluation.evaluate_repeatedly(
         train_dir,
         eval_ops=eval_op,
         hooks=hooks,
@@ -270,6 +273,13 @@ def run(config_map,
   if FLAGS.examples_path:
     config_update_map['%s_examples_path' % FLAGS.mode] = os.path.expanduser(
         FLAGS.examples_path)
+  if FLAGS.tfds_name:
+    if FLAGS.examples_path:
+      raise ValueError(
+          'At most one of --examples_path and --tfds_name can be set.')
+    config_update_map['tfds_name'] = FLAGS.tfds_name
+    config_update_map['eval_examples_path'] = None
+    config_update_map['train_examples_path'] = None
   config = configs.update_config(config, config_update_map)
   if FLAGS.num_sync_workers:
     config.hparams.batch_size //= FLAGS.num_sync_workers
@@ -285,9 +295,8 @@ def run(config_map,
     return data.get_dataset(
         config,
         tf_file_reader=tf_file_reader,
-        num_threads=FLAGS.num_data_threads,
-        prefetch_size=FLAGS.prefetch_size,
-        is_training=is_training)
+        is_training=is_training,
+        cache_dataset=FLAGS.cache_dataset)
 
   if is_training:
     train(
@@ -304,6 +313,7 @@ def run(config_map,
   else:
     num_batches = FLAGS.eval_num_batches or data.count_examples(
         config.eval_examples_path,
+        config.tfds_name,
         config.data_converter,
         file_reader) // config.hparams.batch_size
     eval_dir = os.path.join(run_dir, 'eval' + FLAGS.eval_dir_suffix)
@@ -322,6 +332,7 @@ def main(unused_argv):
 
 
 def console_entry_point():
+  tf.disable_v2_behavior()
   tf.app.run(main)
 
 

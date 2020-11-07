@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,6 @@
 # limitations under the License.
 
 """Tests for shared data lib."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import copy
 import tempfile
 import time
@@ -26,13 +21,15 @@ from magenta.models.onsets_frames_transcription import configs
 from magenta.models.onsets_frames_transcription import constants
 from magenta.models.onsets_frames_transcription import data
 
-from magenta.music import audio_io
-from magenta.music import sequences_lib
-from magenta.music import testing_lib
-from magenta.protobuf import music_pb2
+from note_seq import audio_io
+from note_seq import sequences_lib
+from note_seq import testing_lib
+from note_seq.protobuf import music_pb2
 
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+
+tf.disable_v2_behavior()
 
 
 class DataTest(tf.test.TestCase):
@@ -118,7 +115,8 @@ class DataTest(tf.test.TestCase):
                             examples,
                             truncated_length,
                             batch_size,
-                            expected_inputs):
+                            expected_inputs,
+                            feed_dict=None):
     """Tests for correctness of batches."""
     hparams = copy.deepcopy(configs.DEFAULT_HPARAMS)
     hparams.batch_size = batch_size
@@ -129,15 +127,17 @@ class DataTest(tf.test.TestCase):
       dataset = data.provide_batch(
           examples=examples,
           preprocess_examples=True,
-          hparams=hparams,
-          is_training=False)
+          params=hparams,
+          is_training=False,
+          shuffle_examples=False,
+          skip_n_initial_records=0)
       iterator = dataset.make_initializable_iterator()
       next_record = iterator.get_next()
       sess.run([
           tf.initializers.local_variables(),
           tf.initializers.global_variables(),
           iterator.initializer
-      ])
+      ], feed_dict=feed_dict)
       for i in range(0, len(expected_inputs), batch_size):
         # Wait to ensure example is pre-processed.
         time.sleep(0.1)
@@ -168,11 +168,10 @@ class DataTest(tf.test.TestCase):
         seq, 0, [(note, 100, 0, duration)])
     return seq
 
-  def _ValidateProvideBatchTFRecord(self,
-                                    truncated_length,
-                                    batch_size,
-                                    lengths,
-                                    expected_num_inputs):
+  def _CreateExamplesAndExpectedInputs(self,
+                                       truncated_length,
+                                       lengths,
+                                       expected_num_inputs):
     hparams = copy.deepcopy(configs.DEFAULT_HPARAMS)
     examples = []
     expected_inputs = []
@@ -195,6 +194,15 @@ class DataTest(tf.test.TestCase):
           examples[-1],
           truncated_length)
     self.assertEqual(expected_num_inputs, len(expected_inputs))
+    return examples, expected_inputs
+
+  def _ValidateProvideBatchTFRecord(self,
+                                    truncated_length,
+                                    batch_size,
+                                    lengths,
+                                    expected_num_inputs):
+    examples, expected_inputs = self._CreateExamplesAndExpectedInputs(
+        truncated_length, lengths, expected_num_inputs)
 
     with tempfile.NamedTemporaryFile() as temp_tfr:
       with tf.python_io.TFRecordWriter(temp_tfr.name) as writer:
@@ -212,34 +220,31 @@ class DataTest(tf.test.TestCase):
                                   batch_size,
                                   lengths,
                                   expected_num_inputs):
-    hparams = copy.deepcopy(configs.DEFAULT_HPARAMS)
-    examples = []
-    expected_inputs = []
-
-    for i, length in enumerate(lengths):
-      wav_samples = np.zeros(
-          (np.int((length / data.hparams_frames_per_second(hparams)) *
-                  hparams.sample_rate), 1), np.float32)
-      wav_data = audio_io.samples_to_wav_data(wav_samples, hparams.sample_rate)
-
-      num_frames = data.wav_to_num_frames(
-          wav_data, frames_per_second=data.hparams_frames_per_second(hparams))
-
-      seq = self._SyntheticSequence(
-          num_frames / data.hparams_frames_per_second(hparams),
-          i + constants.MIN_MIDI_PITCH)
-
-      examples.append(self._FillExample(seq, wav_data, 'ex%d' % i))
-      expected_inputs += self._ExampleToInputs(
-          examples[-1],
-          truncated_length)
-    self.assertEqual(expected_num_inputs, len(expected_inputs))
+    examples, expected_inputs = self._CreateExamplesAndExpectedInputs(
+        truncated_length, lengths, expected_num_inputs)
 
     self._ValidateProvideBatch(
         [e.SerializeToString() for e in examples],
         truncated_length,
         batch_size,
         expected_inputs)
+
+  def _ValidateProvideBatchPlaceholder(self,
+                                       truncated_length,
+                                       batch_size,
+                                       lengths,
+                                       expected_num_inputs):
+    examples, expected_inputs = self._CreateExamplesAndExpectedInputs(
+        truncated_length, lengths, expected_num_inputs)
+    examples_ph = tf.placeholder(tf.string, [None])
+    feed_dict = {examples_ph: [e.SerializeToString() for e in examples]}
+
+    self._ValidateProvideBatch(
+        examples_ph,
+        truncated_length,
+        batch_size,
+        expected_inputs,
+        feed_dict=feed_dict)
 
   def _ValidateProvideBatchBoth(self,
                                 truncated_length,
@@ -252,6 +257,11 @@ class DataTest(tf.test.TestCase):
         lengths=lengths,
         expected_num_inputs=expected_num_inputs)
     self._ValidateProvideBatchMemory(
+        truncated_length=truncated_length,
+        batch_size=batch_size,
+        lengths=lengths,
+        expected_num_inputs=expected_num_inputs)
+    self._ValidateProvideBatchPlaceholder(
         truncated_length=truncated_length,
         batch_size=batch_size,
         lengths=lengths,
@@ -270,6 +280,37 @@ class DataTest(tf.test.TestCase):
         batch_size=2,
         lengths=[10, 50, 100, 10, 50, 80],
         expected_num_inputs=6)
+
+  def testGeneratedShardedFilenamesCommaWithShard(self):
+    filenames = data.generate_sharded_filenames('/foo/bar@3,/baz/qux@2')
+    self.assertEqual(
+        [
+            '/foo/bar-00000-of-00003',
+            '/foo/bar-00001-of-00003',
+            '/foo/bar-00002-of-00003',
+            '/baz/qux-00000-of-00002',
+            '/baz/qux-00001-of-00002',
+        ],
+        filenames)
+
+  def testGeneratedShardedFilenamesCommaWithoutShard(self):
+    filenames = data.generate_sharded_filenames('/foo/bar,/baz/qux')
+    self.assertEqual(
+        [
+            '/foo/bar',
+            '/baz/qux',
+        ],
+        filenames)
+
+  def testCombineTensorBatch(self):
+    with tf.Graph().as_default():
+      tensor = tf.constant([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+      lengths = tf.constant([3, 2])
+      combined = data.combine_tensor_batch(
+          tensor, lengths, max_length=5, batch_size=2)
+      sess = tf.Session()
+      np.testing.assert_equal([1, 2, 3, 4, 5, 0, 0, 0, 0, 0],
+                              sess.run(combined))
 
 
 if __name__ == '__main__':

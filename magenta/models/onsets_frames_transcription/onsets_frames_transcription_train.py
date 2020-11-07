@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,17 +18,22 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import os
 
 from magenta.models.onsets_frames_transcription import configs
+from magenta.models.onsets_frames_transcription import data
 from magenta.models.onsets_frames_transcription import train_util
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+
 
 FLAGS = tf.app.flags.FLAGS
 
 tf.app.flags.DEFINE_string('master', '',
                            'Name of the TensorFlow runtime to use.')
+tf.app.flags.DEFINE_string('tpu_cluster', None,
+                           'Name of the TPU Cluster to use.')
 tf.app.flags.DEFINE_string('config', 'onsets_frames',
                            'Name of the config to use.')
 tf.app.flags.DEFINE_string(
@@ -64,10 +69,9 @@ tf.app.flags.DEFINE_string(
     'DEBUG, INFO, WARN, ERROR, or FATAL.')
 
 
-def run(config_map):
+def run(config_map, data_fn, additional_trial_info):
   """Run training or evaluation."""
   tf.logging.set_verbosity(FLAGS.log)
-  tf.app.flags.mark_flags_as_required(['examples_path'])
 
   config = config_map[FLAGS.config]
   model_dir = os.path.expanduser(FLAGS.model_dir)
@@ -80,10 +84,12 @@ def run(config_map):
   if FLAGS.mode == 'train':
     train_util.train(
         model_fn=config.model_fn,
+        data_fn=data_fn,
+        additional_trial_info=additional_trial_info,
         master=FLAGS.master,
+        tpu_cluster=FLAGS.tpu_cluster,
         model_dir=model_dir,
         use_tpu=FLAGS.use_tpu,
-        examples_path=FLAGS.examples_path,
         preprocess_examples=FLAGS.preprocess_examples,
         hparams=hparams,
         keep_checkpoint_max=FLAGS.keep_checkpoint_max,
@@ -91,10 +97,11 @@ def run(config_map):
   elif FLAGS.mode == 'eval':
     train_util.evaluate(
         model_fn=config.model_fn,
+        data_fn=data_fn,
+        additional_trial_info=additional_trial_info,
         master=FLAGS.master,
         model_dir=model_dir,
         name=FLAGS.eval_name,
-        examples_path=FLAGS.examples_path,
         preprocess_examples=FLAGS.preprocess_examples,
         hparams=hparams,
         num_steps=FLAGS.eval_num_steps)
@@ -104,10 +111,15 @@ def run(config_map):
 
 def main(argv):
   del argv
-  run(configs.CONFIG_MAP)
+  tf.app.flags.mark_flags_as_required(['examples_path'])
+  data_fn = functools.partial(data.provide_batch, examples=FLAGS.examples_path)
+  additional_trial_info = {'examples_path': FLAGS.examples_path}
+  run(config_map=configs.CONFIG_MAP, data_fn=data_fn,
+      additional_trial_info=additional_trial_info)
 
 
 def console_entry_point():
+  tf.disable_v2_behavior()
   tf.app.run(main)
 
 

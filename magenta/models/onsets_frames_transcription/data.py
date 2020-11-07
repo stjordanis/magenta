@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,24 +21,24 @@ Glossary (definitions may not hold outside of this particular file):
   example: An individual training example. The number of frames in an example
       is determined by the sequence length.
 """
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
 
 import collections
 import functools
+import io
+import re
 import wave
 import zlib
 
 import librosa
 from magenta.models.onsets_frames_transcription import audio_transform
 from magenta.models.onsets_frames_transcription import constants
-from magenta.music import audio_io
-from magenta.music import sequences_lib
-from magenta.protobuf import music_pb2
+from magenta.models.onsets_frames_transcription import drum_mappings
+from magenta.models.onsets_frames_transcription import melspec_input
+from note_seq import audio_io
+from note_seq import sequences_lib
+from note_seq.protobuf import music_pb2
 import numpy as np
-import six
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 
 def hparams_frame_size(hparams):
@@ -126,13 +126,45 @@ def wav_to_spec(wav_audio, hparams):
 
 
 def wav_to_spec_op(wav_audio, hparams):
-  spec = tf.py_func(
-      functools.partial(wav_to_spec, hparams=hparams),
-      [wav_audio],
-      tf.float32,
-      name='wav_to_spec')
-  spec.set_shape([None, hparams_frame_size(hparams)])
+  """Return an op for converting wav audio to a spectrogram."""
+  if hparams.spec_type == 'tflite_compat_mel':
+    assert hparams.spec_log_amplitude
+    spec = tflite_compat_mel(wav_audio, hparams=hparams)
+  else:
+    spec = tf.py_func(
+        functools.partial(wav_to_spec, hparams=hparams),
+        [wav_audio],
+        tf.float32,
+        name='wav_to_spec')
+    spec.set_shape([None, hparams_frame_size(hparams)])
   return spec
+
+
+def tflite_compat_mel(wav_audio, hparams):
+  """EXPERIMENTAL: Log mel spec with ops that can be made TFLite compatible."""
+  samples, decoded_sample_rate = tf.audio.decode_wav(
+      wav_audio, desired_channels=1)
+  samples = tf.squeeze(samples, axis=1)
+  # Ensure that we decoded the samples at the expected sample rate.
+  with tf.control_dependencies(
+      [tf.assert_equal(decoded_sample_rate, hparams.sample_rate)]):
+    return tflite_compat_mel_from_samples(samples, hparams)
+
+
+def tflite_compat_mel_from_samples(samples, hparams):
+  """EXPERIMENTAL: Log mel spec with ops that can be made TFLite compatible."""
+  features = melspec_input.build_mel_calculation_graph(
+      samples, hparams.sample_rate,
+      window_length_seconds=2048 / hparams.sample_rate,
+      hop_length_seconds=(
+          hparams.spec_hop_length / hparams.sample_rate),
+      num_mel_bins=hparams.spec_n_bins,
+      lower_edge_hz=hparams.spec_fmin,
+      upper_edge_hz=hparams.sample_rate / 2.0,
+      frame_width=1,
+      frame_hop=1,
+      tflite_compatible=False)  # False here, but would be True on device.
+  return tf.squeeze(features, 1)
 
 
 def get_spectrogram_hash_op(spectrogram):
@@ -140,9 +172,10 @@ def get_spectrogram_hash_op(spectrogram):
   def get_spectrogram_hash(spectrogram):
     # Compute a hash of the spectrogram, save it as an int64.
     # Uses adler because it's fast and will fit into an int (md5 is too large).
-    spectrogram_serialized = six.BytesIO()
+    spectrogram_serialized = io.BytesIO()
     np.save(spectrogram_serialized, spectrogram)
     spectrogram_hash = np.int64(zlib.adler32(spectrogram_serialized.getvalue()))
+    spectrogram_serialized.close()
     return spectrogram_hash
   spectrogram_hash = tf.py_func(get_spectrogram_hash, [spectrogram], tf.int64,
                                 name='get_spectrogram_hash')
@@ -152,7 +185,7 @@ def get_spectrogram_hash_op(spectrogram):
 
 def wav_to_num_frames(wav_audio, frames_per_second):
   """Transforms a wav-encoded audio string into number of frames."""
-  w = wave.open(six.BytesIO(wav_audio))
+  w = wave.open(io.BytesIO(wav_audio))
   return np.int32(w.getnframes() / w.getframerate() * frames_per_second)
 
 
@@ -277,16 +310,22 @@ InputTensors = collections.namedtuple(
                      'note_sequence'))
 
 
-def preprocess_data(sequence_id, sequence, audio, velocity_range, hparams,
-                    is_training):
+def parse_example(example_proto):
+  features = {
+      'id': tf.FixedLenFeature(shape=(), dtype=tf.string),
+      'sequence': tf.FixedLenFeature(shape=(), dtype=tf.string),
+      'audio': tf.FixedLenFeature(shape=(), dtype=tf.string),
+      'velocity_range': tf.FixedLenFeature(shape=(), dtype=tf.string),
+  }
+  record = tf.parse_single_example(example_proto, features)
+  return record
+
+
+def preprocess_example(example_proto, hparams, is_training):
   """Compute spectral representation, labels, and length from sequence/audio.
 
   Args:
-    sequence_id: id of the sequence.
-    sequence: String tensor containing serialized NoteSequence proto.
-    audio: String tensor containing containing WAV data.
-    velocity_range: String tensor containing max and min velocities of file as a
-      serialized VelocityRange.
+    example_proto: Example that has not been preprocessed.
     hparams: HParams object specifying hyperparameters.
     is_training: Whether or not this is a training run.
 
@@ -296,6 +335,11 @@ def preprocess_data(sequence_id, sequence, audio, velocity_range, hparams,
   Raises:
     ValueError: If hparams is contains an invalid spec_type.
   """
+  record = parse_example(example_proto)
+  sequence_id = record['id']
+  sequence = record['sequence']
+  audio = record['audio']
+  velocity_range = record['velocity_range']
 
   wav_jitter_amount_ms = label_jitter_amount_ms = 0
   # if there is combined jitter, we must generate it once here
@@ -344,24 +388,52 @@ def preprocess_data(sequence_id, sequence, audio, velocity_range, hparams,
         note_sequence=sequence)
 
 
+def input_tensors_to_example(inputs, hparams):
+  """Convert InputTensors to Example proto ready for serialization."""
+  del hparams
+
+  feature = {
+      'spec': tf.train.Feature(
+          float_list=tf.train.FloatList(value=inputs.spec.flatten())),
+      'spectrogram_hash': tf.train.Feature(
+          int64_list=tf.train.Int64List(value=[inputs.spectrogram_hash])),
+      'labels': tf.train.Feature(
+          float_list=tf.train.FloatList(value=inputs.labels.flatten())),
+      'label_weights': tf.train.Feature(
+          float_list=tf.train.FloatList(value=inputs.label_weights.flatten())),
+      'length': tf.train.Feature(
+          int64_list=tf.train.Int64List(value=[inputs.length])),
+      'onsets': tf.train.Feature(
+          float_list=tf.train.FloatList(value=inputs.onsets.flatten())),
+      'offsets': tf.train.Feature(
+          float_list=tf.train.FloatList(value=inputs.offsets.flatten())),
+      'velocities': tf.train.Feature(
+          float_list=tf.train.FloatList(value=inputs.velocities.flatten())),
+      'sequence_id': tf.train.Feature(
+          bytes_list=tf.train.BytesList(value=[inputs.sequence_id])),
+      'note_sequence': tf.train.Feature(
+          bytes_list=tf.train.BytesList(value=[inputs.note_sequence])),
+  }
+
+  return tf.train.Example(features=tf.train.Features(feature=feature))
+
+
 FeatureTensors = collections.namedtuple(
-    'FeatureTensors', ('spec', 'length', 'sequence_id', 'spectrogram_hash'))
+    'FeatureTensors', ('spec', 'length', 'sequence_id'))
 LabelTensors = collections.namedtuple(
     'LabelTensors', ('labels', 'label_weights', 'onsets', 'offsets',
                      'velocities', 'note_sequence'))
 
 
-def _provide_data(input_tensors, hparams, is_training):
-  """Returns tensors for reading batches from provider."""
+def input_tensors_to_model_input(
+    input_tensors, hparams, is_training, num_classes=constants.MIDI_PITCHES):
+  """Processes an InputTensor into FeatureTensors and LabelTensors."""
   length = tf.cast(input_tensors.length, tf.int32)
-  spectrogram_hash = tf.cast(input_tensors.spectrogram_hash, tf.int64)
-  labels = tf.reshape(input_tensors.labels, (-1, constants.MIDI_PITCHES))
-  label_weights = tf.reshape(input_tensors.label_weights,
-                             (-1, constants.MIDI_PITCHES))
-  onsets = tf.reshape(input_tensors.onsets, (-1, constants.MIDI_PITCHES))
-  offsets = tf.reshape(input_tensors.offsets, (-1, constants.MIDI_PITCHES))
-  velocities = tf.reshape(input_tensors.velocities,
-                          (-1, constants.MIDI_PITCHES))
+  labels = tf.reshape(input_tensors.labels, (-1, num_classes))
+  label_weights = tf.reshape(input_tensors.label_weights, (-1, num_classes))
+  onsets = tf.reshape(input_tensors.onsets, (-1, num_classes))
+  offsets = tf.reshape(input_tensors.offsets, (-1, num_classes))
+  velocities = tf.reshape(input_tensors.velocities, (-1, num_classes))
   spec = tf.reshape(input_tensors.spec, (-1, hparams_frame_size(hparams)))
 
   # Slice specs and labels tensors so they are no longer than truncated_length.
@@ -384,8 +456,12 @@ def _provide_data(input_tensors, hparams, is_training):
   if hparams.max_expected_train_example_len and is_training:
     # In this case, final_length is a constant.
     if hparams.truncated_length_secs:
-      assert hparams.max_expected_train_example_len == hparams_truncated_length
-    final_length = hparams.max_expected_train_example_len
+      assert_op = tf.assert_equal(hparams.max_expected_train_example_len,
+                                  hparams_truncated_length)
+      with tf.control_dependencies([assert_op]):
+        final_length = hparams.max_expected_train_example_len
+    else:
+      final_length = hparams.max_expected_train_example_len
   else:
     # In this case, it is min(hparams.truncated_length, length)
     final_length = truncated_length
@@ -426,44 +502,101 @@ def _provide_data(input_tensors, hparams, is_training):
   features = FeatureTensors(
       spec=tf.reshape(spec, (final_length, hparams_frame_size(hparams), 1)),
       length=truncated_length,
-      sequence_id=tf.constant(0) if is_training else input_tensors.sequence_id,
-      spectrogram_hash=spectrogram_hash)
+      sequence_id=tf.constant(0) if is_training else input_tensors.sequence_id)
   labels = LabelTensors(
-      labels=tf.reshape(labels, (final_length, constants.MIDI_PITCHES)),
-      label_weights=tf.reshape(label_weights,
-                               (final_length, constants.MIDI_PITCHES)),
-      onsets=tf.reshape(onsets, (final_length, constants.MIDI_PITCHES)),
-      offsets=tf.reshape(offsets, (final_length, constants.MIDI_PITCHES)),
-      velocities=tf.reshape(velocities, (final_length, constants.MIDI_PITCHES)),
+      labels=tf.reshape(labels, (final_length, num_classes)),
+      label_weights=tf.reshape(label_weights, (final_length, num_classes)),
+      onsets=tf.reshape(onsets, (final_length, num_classes)),
+      offsets=tf.reshape(offsets, (final_length, num_classes)),
+      velocities=tf.reshape(velocities, (final_length, num_classes)),
       note_sequence=truncated_note_sequence)
+
+  if hparams.drum_data_map:
+    labels_dict = labels._asdict()
+    for k in ('labels', 'onsets', 'offsets'):
+      labels_dict[k] = drum_mappings.map_pianoroll(
+          labels_dict[k],
+          mapping_name=hparams.drum_data_map,
+          reduce_mode='any',
+          min_pitch=constants.MIN_MIDI_PITCH)
+    for k in ('label_weights', 'velocities'):
+      labels_dict[k] = drum_mappings.map_pianoroll(
+          labels_dict[k],
+          mapping_name=hparams.drum_data_map,
+          reduce_mode='max',
+          min_pitch=constants.MIN_MIDI_PITCH)
+    if labels_dict['note_sequence'].dtype == tf.string:
+      labels_dict['note_sequence'] = tf.py_func(
+          functools.partial(
+              drum_mappings.map_sequences, mapping_name=hparams.drum_data_map),
+          [labels_dict['note_sequence']],
+          tf.string,
+          name='get_drum_sequences',
+          stateful=False)
+      labels_dict['note_sequence'].set_shape(())
+    labels = LabelTensors(**labels_dict)
 
   return features, labels
 
 
-def provide_batch(examples,
-                  preprocess_examples,
-                  hparams,
-                  is_training=True,
-                  shuffle_buffer_size=64):
-  """Returns batches of tensors read from TFRecord files.
+def generate_sharded_filenames(sharded_filenames):
+  """Generate a list of filenames from a filename with an @shards suffix."""
+  filenames = []
+  for filename in sharded_filenames.split(','):
+    match = re.match(r'^([^@]+)@(\d+)$', filename)
+    if not match:
+      filenames.append(filename)
+    else:
+      num_shards = int(match.group(2))
+      base = match.group(1)
+      for i in range(num_shards):
+        filenames.append('{}-{:0=5d}-of-{:0=5d}'.format(base, i, num_shards))
+  return filenames
+
+
+def sharded_tfrecord_reader(fname):
+  """Generator for reading TFRecord entries across multiple shards."""
+  for sfname in generate_sharded_filenames(fname):
+    for r in tf.python_io.tf_record_iterator(sfname):
+      yield  r
+
+
+def read_examples(examples, is_training, shuffle_examples,
+                  skip_n_initial_records, hparams):
+  """Returns a tf.data.Dataset from TFRecord files.
 
   Args:
     examples: A string path to a TFRecord file of examples, a python list of
       serialized examples, or a Tensor placeholder for serialized examples.
-    preprocess_examples: Whether to preprocess examples. If False, assume they
-      have already been preprocessed.
-    hparams: HParams object specifying hyperparameters.
     is_training: Whether this is a training run.
-    shuffle_buffer_size: Buffer size used to shuffle records.
+    shuffle_examples: Whether examples should be shuffled.
+    skip_n_initial_records: Skip this many records at first.
+    hparams: HParams object specifying hyperparameters.
 
   Returns:
-    Batched tensors in a TranscriptionData NamedTuple.
+    A tf.data.Dataset.
   """
+  if is_training and not shuffle_examples:
+    raise ValueError('shuffle_examples must be True if is_training is True')
+
   if isinstance(examples, str):
     # Read examples from a TFRecord file containing serialized NoteSequence
     # and audio.
-    filenames = tf.data.Dataset.list_files(examples, shuffle=is_training)
-    if is_training:
+    sharded_filenames = generate_sharded_filenames(examples)
+    if len(sharded_filenames) == 1:
+      # Could be a glob pattern.
+      filenames = tf.data.Dataset.list_files(
+          generate_sharded_filenames(examples), shuffle=shuffle_examples)
+    else:
+      # If we've already expanded the list of sharded filenames, don't send to
+      # Dataset.list_files because that will attempt to execute a potentially
+      # slow (especially for network filesystems) glob expansion on each entry
+      # in the already expanded list.
+      if shuffle_examples:
+        np.random.shuffle(sharded_filenames)
+      filenames = tf.data.Dataset.from_tensor_slices(sharded_filenames)
+
+    if shuffle_examples:
       input_dataset = filenames.apply(
           tf.data.experimental.parallel_interleave(
               tf.data.TFRecordDataset, sloppy=True, cycle_length=8))
@@ -472,61 +605,143 @@ def provide_batch(examples,
   else:
     input_dataset = tf.data.Dataset.from_tensor_slices(examples)
 
+  if shuffle_examples:
+    input_dataset = input_dataset.shuffle(hparams.shuffle_buffer_size)
   if is_training:
-    input_dataset = input_dataset.apply(
-        tf.data.experimental.shuffle_and_repeat(shuffle_buffer_size))
+    input_dataset = input_dataset.repeat()
+  if skip_n_initial_records:
+    input_dataset = input_dataset.skip(skip_n_initial_records)
 
-  def _preprocess(example_proto):
-    """Process an Example proto into a model input."""
-    features = {
-        'id': tf.FixedLenFeature(shape=(), dtype=tf.string),
-        'sequence': tf.FixedLenFeature(shape=(), dtype=tf.string),
-        'audio': tf.FixedLenFeature(shape=(), dtype=tf.string),
-        'velocity_range': tf.FixedLenFeature(shape=(), dtype=tf.string),
-    }
-    record = tf.parse_single_example(example_proto, features)
-    input_tensors = preprocess_data(record['id'], record['sequence'],
-                                    record['audio'], record['velocity_range'],
-                                    hparams, is_training)
-    return _provide_data(
-        input_tensors, hparams=hparams, is_training=is_training)
+  return input_dataset
 
-  def _parse(example_proto):
-    """Process an Example proto into a model input."""
-    features = {
-        'spec': tf.VarLenFeature(dtype=tf.float32),
-        'spectrogram_hash': tf.FixedLenFeature(shape=(), dtype=tf.int64),
-        'labels': tf.VarLenFeature(dtype=tf.float32),
-        'label_weights': tf.VarLenFeature(dtype=tf.float32),
-        'length': tf.FixedLenFeature(shape=(), dtype=tf.int64),
-        'onsets': tf.VarLenFeature(dtype=tf.float32),
-        'offsets': tf.VarLenFeature(dtype=tf.float32),
-        'velocities': tf.VarLenFeature(dtype=tf.float32),
-        'sequence_id': tf.FixedLenFeature(shape=(), dtype=tf.string),
-        'note_sequence': tf.FixedLenFeature(shape=(), dtype=tf.string),
-    }
-    record = tf.parse_single_example(example_proto, features)
-    input_tensors = InputTensors(
-        spec=tf.sparse.to_dense(record['spec']),
-        spectrogram_hash=record['spectrogram_hash'],
-        labels=tf.sparse.to_dense(record['labels']),
-        label_weights=tf.sparse.to_dense(record['label_weights']),
-        length=record['length'],
-        onsets=tf.sparse.to_dense(record['onsets']),
-        offsets=tf.sparse.to_dense(record['offsets']),
-        velocities=tf.sparse.to_dense(record['velocities']),
-        sequence_id=record['sequence_id'],
-        note_sequence=record['note_sequence'])
-    return _provide_data(
-        input_tensors, hparams=hparams, is_training=is_training)
 
-  dataset = input_dataset.map(_preprocess if preprocess_examples else _parse)
-  if hparams.max_expected_train_example_len:
-    dataset = dataset.batch(hparams.batch_size, drop_remainder=is_training)
+def parse_preprocessed_example(example_proto):
+  """Process an already preprocessed Example proto into input tensors."""
+  features = {
+      'spec': tf.VarLenFeature(dtype=tf.float32),
+      'spectrogram_hash': tf.FixedLenFeature(shape=(), dtype=tf.int64),
+      'labels': tf.VarLenFeature(dtype=tf.float32),
+      'label_weights': tf.VarLenFeature(dtype=tf.float32),
+      'length': tf.FixedLenFeature(shape=(), dtype=tf.int64),
+      'onsets': tf.VarLenFeature(dtype=tf.float32),
+      'offsets': tf.VarLenFeature(dtype=tf.float32),
+      'velocities': tf.VarLenFeature(dtype=tf.float32),
+      'sequence_id': tf.FixedLenFeature(shape=(), dtype=tf.string),
+      'note_sequence': tf.FixedLenFeature(shape=(), dtype=tf.string),
+  }
+  record = tf.parse_single_example(example_proto, features)
+  input_tensors = InputTensors(
+      spec=tf.sparse.to_dense(record['spec']),
+      spectrogram_hash=record['spectrogram_hash'],
+      labels=tf.sparse.to_dense(record['labels']),
+      label_weights=tf.sparse.to_dense(record['label_weights']),
+      length=record['length'],
+      onsets=tf.sparse.to_dense(record['onsets']),
+      offsets=tf.sparse.to_dense(record['offsets']),
+      velocities=tf.sparse.to_dense(record['velocities']),
+      sequence_id=record['sequence_id'],
+      note_sequence=record['note_sequence'])
+  return input_tensors
+
+
+def create_batch(dataset, hparams, is_training, batch_size=None):
+  """Batch a dataset, optional batch_size override."""
+  if not batch_size:
+    batch_size = hparams.batch_size
+  if hparams.max_expected_train_example_len and is_training:
+    dataset = dataset.batch(batch_size, drop_remainder=True)
   else:
     dataset = dataset.padded_batch(
-        hparams.batch_size, padded_shapes=dataset.output_shapes)
-
-  dataset = dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)
-
+        batch_size,
+        padded_shapes=dataset.output_shapes,
+        drop_remainder=True)
   return dataset
+
+
+def combine_tensor_batch(tensor, lengths, max_length, batch_size):
+  """Combine a batch of variable-length tensors into a single tensor."""
+  combined = tf.concat([tensor[i, :lengths[i]] for i in range(batch_size)],
+                       axis=0)
+  final_length = max_length * batch_size
+  combined_padded = tf.pad(combined,
+                           [(0, final_length - tf.shape(combined)[0])] +
+                           [(0, 0)] * (combined.shape.rank - 1))
+  combined_padded.set_shape([final_length] + combined_padded.shape[1:])
+  return combined_padded
+
+
+def splice_examples(dataset, hparams, is_training):
+  """Splice together several examples into a single example."""
+  if (not is_training) or hparams.splice_n_examples == 0:
+    return dataset
+  else:
+    dataset = dataset.padded_batch(
+        hparams.splice_n_examples, padded_shapes=dataset.output_shapes)
+
+    def _splice(features, labels):
+      """Splice together a batch of examples into a single example."""
+      combine = functools.partial(
+          combine_tensor_batch,
+          lengths=features.length,
+          max_length=hparams.max_expected_train_example_len,
+          batch_size=hparams.splice_n_examples)
+
+      combined_features = FeatureTensors(
+          spec=combine(features.spec),
+          length=tf.reduce_sum(features.length),
+          sequence_id=tf.constant(0))
+      combined_labels = LabelTensors(
+          labels=combine(labels.labels),
+          label_weights=combine(labels.label_weights),
+          onsets=combine(labels.onsets),
+          offsets=combine(labels.offsets),
+          velocities=combine(labels.velocities),
+          note_sequence=tf.constant(0))
+      return combined_features, combined_labels
+
+    combined_dataset = dataset.map(_splice)
+    return combined_dataset
+
+
+def provide_batch(examples,
+                  preprocess_examples,
+                  params,
+                  is_training,
+                  shuffle_examples,
+                  skip_n_initial_records):
+  """Returns batches of tensors read from TFRecord files.
+
+  Args:
+    examples: A string path to a TFRecord file of examples, a python list of
+      serialized examples, or a Tensor placeholder for serialized examples.
+    preprocess_examples: Whether to preprocess examples. If False, assume they
+      have already been preprocessed.
+    params: HParams object specifying hyperparameters. Called 'params' here
+      because that is the interface that TPUEstimator expects.
+    is_training: Whether this is a training run.
+    shuffle_examples: Whether examples should be shuffled.
+    skip_n_initial_records: Skip this many records at first.
+
+  Returns:
+    Batched tensors in a TranscriptionData NamedTuple.
+  """
+  hparams = params
+
+  input_dataset = read_examples(
+      examples, is_training, shuffle_examples, skip_n_initial_records, hparams)
+
+  if preprocess_examples:
+    input_map_fn = functools.partial(
+        preprocess_example, hparams=hparams, is_training=is_training)
+  else:
+    input_map_fn = parse_preprocessed_example
+  input_tensors = input_dataset.map(input_map_fn)
+
+  model_input = input_tensors.map(
+      functools.partial(
+          input_tensors_to_model_input,
+          hparams=hparams, is_training=is_training))
+
+  model_input = splice_examples(model_input, hparams, is_training)
+  dataset = create_batch(model_input, hparams=hparams, is_training=is_training)
+  return dataset.prefetch(buffer_size=tf.data.experimental.AUTOTUNE)

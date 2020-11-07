@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,18 +13,13 @@
 # limitations under the License.
 
 """Piano Genie training script."""
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
 
 from magenta.models.piano_genie import util
 from magenta.models.piano_genie.configs import get_named_config
 from magenta.models.piano_genie.loader import load_noteseqs
 from magenta.models.piano_genie.model import build_genie_model
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 flags = tf.app.flags
 FLAGS = flags.FLAGS
@@ -32,7 +27,8 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("dataset_fp", "./data/train*.tfrecord",
                     "Path to dataset containing TFRecords of NoteSequences.")
 flags.DEFINE_string("train_dir", "", "The directory for this experiment")
-flags.DEFINE_string("model_cfg", "stp_iq_auto", "Hyperparameter configuration.")
+flags.DEFINE_string("model_cfg", "piano_genie_paper",
+                    "Hyperparameter configuration.")
 flags.DEFINE_string("model_cfg_overrides", "",
                     "E.g. rnn_nlayers=4,rnn_nunits=256")
 flags.DEFINE_integer("summary_every_nsecs", 60,
@@ -165,4 +161,5 @@ def main(unused_argv):
 
 
 if __name__ == "__main__":
+  tf.disable_v2_behavior()
   tf.app.run()

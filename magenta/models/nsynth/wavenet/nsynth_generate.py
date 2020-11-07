@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Lint as: python3
 """A binary for generating samples given a folder of .wav files or encodings."""
 
 import os
 
 from magenta.models.nsynth import utils
 from magenta.models.nsynth.wavenet import fastgen
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 
 FLAGS = tf.app.flags.FLAGS
 
@@ -30,7 +31,7 @@ tf.app.flags.DEFINE_boolean("npy_only", False, "If True, use only .npy files.")
 tf.app.flags.DEFINE_string("save_path", "", "Path to output file dir.")
 tf.app.flags.DEFINE_string("checkpoint_path", "model.ckpt-200000",
                            "Path to checkpoint.")
-tf.app.flags.DEFINE_integer("sample_length", 100000000,
+tf.app.flags.DEFINE_integer("sample_length", 64000,
                             "Max output file size in samples.")
 tf.app.flags.DEFINE_integer("batch_size", 1, "Number of samples per a batch.")
 tf.app.flags.DEFINE_string("log", "INFO",
@@ -107,6 +108,7 @@ def main(unused_argv=None):
 
 
 def console_entry_point():
+  tf.disable_v2_behavior()
   tf.app.run(main)
 
 

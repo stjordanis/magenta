@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,26 +14,27 @@
 
 """Tensorflow-related utilities."""
 
-import tensorflow as tf
+from magenta.contrib import training as contrib_training
+import tensorflow.compat.v1 as tf
 
 
 def merge_hparams(hparams_1, hparams_2):
-  """Merge hyperparameters from two tf.HParams objects.
+  """Merge hyperparameters from two tf.contrib.training.HParams objects.
 
   If the same key is present in both HParams objects, the value from `hparams_2`
   will be used.
 
   Args:
-    hparams_1: The first tf.HParams object to merge.
-    hparams_2: The second tf.HParams object to merge.
+    hparams_1: The first tf.contrib.training.HParams object to merge.
+    hparams_2: The second tf.contrib.training.HParams object to merge.
 
   Returns:
-    A merged tf.HParams object with the hyperparameters from both `hparams_1`
-    and `hparams_2`.
+    A merged tf.contrib.training.HParams object with the hyperparameters from
+    both `hparams_1` and `hparams_2`.
   """
   hparams_map = hparams_1.values()
   hparams_map.update(hparams_2.values())
-  return tf.contrib.training.HParams(**hparams_map)
+  return contrib_training.HParams(**hparams_map)
 
 
 def log_loss(labels, predictions, epsilon=1e-7, scope=None, weights=None):

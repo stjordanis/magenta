@@ -1,4 +1,4 @@
-# Copyright 2019 The Magenta Authors.
+# Copyright 2020 The Magenta Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Lint as: python2, python3
 """Hyperparameter configurations for Piano Genie."""
 
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+import six
 
 
 class BasePianoGenieConfig(object):
@@ -372,6 +374,20 @@ class StpVqSeqFreeAutoDtVs(BasePianoGenieConfig):
     self.dec_aux_feats = ["delta_times_int", "velocities"]
 
 
+class PianoGeniePaper(BasePianoGenieConfig):
+  """Config matching Piano Genie paper."""
+
+  def __init__(self):
+    super(PianoGeniePaper, self).__init__()
+
+    self.enc_aux_feats = ["delta_times_int"]
+    self.dec_autoregressive = True
+    self.dec_aux_feats = ["delta_times_int"]
+    self.stp_emb_iq = True
+    self.stp_emb_iq_contour_margin = 1.
+    self.stp_emb_iq_deviate_exp = 1
+
+
 _named_configs = {
     "stp_free": StpFree(),
     "stp_vq": StpVq(),
@@ -401,6 +417,7 @@ _named_configs = {
     "stp_vq_seq_free_auto_vs": StpVqSeqFreeAutoVs(),
     "stp_vq_seq_vae_auto_dt_vs": StpVqSeqVaeAutoDtVs(),
     "stp_vq_seq_vae_free_dt_vs": StpVqSeqFreeAutoDtVs(),
+    "piano_genie_paper": PianoGeniePaper(),
 }
 
 
@@ -418,7 +435,7 @@ def get_named_config(name, overrides=None):
   cfg = _named_configs[name]
 
   if overrides is not None and overrides.strip():
-    overrides = [p.split("=") for p in overrides.split(",")]
+    overrides = [p.split("=") for p in six.ensure_str(overrides).split(",")]
     for key, val in overrides:
       val_type = type(getattr(cfg, key))
       if val_type == bool:
@@ -430,7 +447,7 @@ def get_named_config(name, overrides=None):
 
   summary = "\n".join([
       "{},{}".format(k, v)
-      for k, v in sorted(vars(cfg).items(), key=lambda x: x[0])
+      for k, v in sorted(list(vars(cfg).items()), key=lambda x: x[0])
   ])
 
   return cfg, summary
